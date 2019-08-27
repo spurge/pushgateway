@@ -67,6 +67,7 @@ func main() {
 		enableAdminAPI      = app.Flag("web.enable-admin-api", "Enable API endpoints for admin control actions.").Default("false").Bool()
 		persistenceFile     = app.Flag("persistence.file", "File to persist metrics. If empty, metrics are only kept in memory.").Default("").String()
 		persistenceInterval = app.Flag("persistence.interval", "The minimum interval at which to write out the persistence file.").Default("5m").Duration()
+		storageType         = app.Flag("storage.type", "Type of storage, either diskmetricstore or atomicdiskmetricstore").Default("diskmetricstore").String()
 		promlogConfig       = promlog.Config{}
 	)
 	promlogflag.AddFlags(app, &promlogConfig)
@@ -94,7 +95,19 @@ func main() {
 		}
 	}
 
-	ms := storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, logger)
+	var ms storage.MetricStore
+
+	switch *storageType {
+	case "diskmetricstore":
+		ms = storage.NewDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, logger)
+		break
+	case "atomicdiskmetricstore":
+		ms = storage.NewAtomicDiskMetricStore(*persistenceFile, *persistenceInterval, prometheus.DefaultGatherer, logger)
+		break
+	default:
+		level.Error(logger).Log("There's no storage type named %s", storageType)
+		os.Exit(1)
+	}
 
 	// Create a Gatherer combining the DefaultGatherer and the metrics from the metric store.
 	g := prometheus.Gatherers{
