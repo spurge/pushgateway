@@ -14,6 +14,7 @@
 package storage
 
 import (
+	"encoding/base64"
 	"math/rand"
 	"testing"
 	"time"
@@ -60,14 +61,15 @@ func (m *MockedDiskMetricStore) SubmitWriteRequest(wr WriteRequest) {
 var _ MetricStore = &MockedDiskMetricStore{}
 
 type MetricTestRequest struct {
-	Key uint64
+	Name string
+	Key  uint64
 	WriteRequest
 	StoredMetrics GroupingKeyToMetricGroup
 }
 
-func generateMetricFamily() *dto.MetricFamily {
+func generateCounterMetricFamily(name string) *dto.MetricFamily {
 	return &dto.MetricFamily{
-		Name: proto.String("some_metric"),
+		Name: proto.String(name),
 		Type: dto.MetricType_COUNTER.Enum(),
 		Metric: []*dto.Metric{
 			&dto.Metric{
@@ -96,32 +98,71 @@ func generateMetricFamily() *dto.MetricFamily {
 	}
 }
 
+func generateHistogramMetricFamily(name string) *dto.MetricFamily {
+	return &dto.MetricFamily{
+		Name: proto.String(name),
+		Type: dto.MetricType_HISTOGRAM.Enum(),
+		Metric: []*dto.Metric{
+			&dto.Metric{
+				Label: []*dto.LabelPair{
+					&dto.LabelPair{
+						Name:  proto.String("some-label"),
+						Value: proto.String("with-value"),
+					},
+				},
+				Histogram: &dto.Histogram{
+					SampleCount: proto.Uint64(rand.Uint64()),
+					SampleSum:   proto.Float64(rand.Float64() * float64(rand.Int())),
+					Bucket: []*dto.Bucket{
+						&dto.Bucket{
+							CumulativeCount: proto.Uint64(rand.Uint64()),
+							UpperBound:      proto.Float64(rand.Float64() * float64(rand.Int())),
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
 func generateMetricRequests() []*MetricTestRequest {
 	var metricRequests []*MetricTestRequest
 
-	length := rand.Intn(100)
+	length := rand.Intn(30)
 
 	for i := 0; i < length; i++ {
+		rand.Seed(int64(i))
+
+		name := randStr(10)
 		labels := map[string]string{
-			"a label": "with value",
+			randStr(10): randStr(20),
 		}
 		key := model.LabelsToSignature(labels)
 
+		var generator func(string) *dto.MetricFamily
+
+		if rand.Float32() < 0.5 {
+			generator = generateCounterMetricFamily
+		} else {
+			generator = generateHistogramMetricFamily
+		}
+
 		metricRequests = append(metricRequests, &MetricTestRequest{
-			Key: key,
+			Name: name,
+			Key:  key,
 			WriteRequest: WriteRequest{
 				Labels: labels,
 				MetricFamilies: map[string]*dto.MetricFamily{
-					"some_metric": generateMetricFamily(),
+					name: generator(name),
 				},
 			},
 			StoredMetrics: GroupingKeyToMetricGroup{
 				key: MetricGroup{
 					Labels: labels,
 					Metrics: NameToTimestampedMetricFamilyMap{
-						"some_metric": TimestampedMetricFamily{
+						name: TimestampedMetricFamily{
 							Timestamp:            time.Now(),
-							GobbableMetricFamily: (*GobbableMetricFamily)(generateMetricFamily()),
+							GobbableMetricFamily: (*GobbableMetricFamily)(generator(name)),
 						},
 					},
 				},
@@ -132,24 +173,47 @@ func generateMetricRequests() []*MetricTestRequest {
 	return metricRequests
 }
 
+func randStr(length int) string {
+	buf := make([]byte, length)
+	rand.Read(buf)
+	str := base64.StdEncoding.EncodeToString(buf)
+	return str[:length]
+}
+
 func TestAggregation(t *testing.T) {
 	metrics := generateMetricRequests()
 	index := 0
-	tested := 0
-
-	var values []*dto.Metric
+	values := make(map[string][]*dto.Metric)
 
 	dms := &MockedDiskMetricStore{
 		GetMetricFamiliesMapCallback: func() GroupingKeyToMetricGroup {
-			next := metrics[index].WriteRequest.MetricFamilies["some_metric"]
-			values = make([]*dto.Metric, len(next.Metric))
+			name := metrics[index].Name
+			next := metrics[index].WriteRequest.MetricFamilies[name]
+			values[name] = make([]*dto.Metric, len(next.Metric))
 
 			for i := 0; i < len(next.Metric); i++ {
 				switch next.GetType() {
 				case dto.MetricType_COUNTER:
-					values[i] = &dto.Metric{
+					values[name][i] = &dto.Metric{
 						Counter: &dto.Counter{
 							Value: proto.Float64(next.Metric[i].Counter.GetValue()),
+						},
+					}
+				case dto.MetricType_HISTOGRAM:
+					buckets := make([]*dto.Bucket, len(next.Metric[i].Histogram.Bucket))
+
+					for ii := 0; ii < len(buckets); ii++ {
+						buckets[ii] = &dto.Bucket{
+							CumulativeCount: proto.Uint64(next.Metric[i].Histogram.Bucket[ii].GetCumulativeCount()),
+							UpperBound:      proto.Float64(next.Metric[i].Histogram.Bucket[ii].GetUpperBound()),
+						}
+					}
+
+					values[name][i] = &dto.Metric{
+						Histogram: &dto.Histogram{
+							SampleCount: proto.Uint64(next.Metric[i].Histogram.GetSampleCount()),
+							SampleSum:   proto.Float64(next.Metric[i].Histogram.GetSampleSum()),
+							Bucket:      buckets,
 						},
 					}
 				}
@@ -158,26 +222,48 @@ func TestAggregation(t *testing.T) {
 			return metrics[index].StoredMetrics
 		},
 		SubmitWriteRequestCallback: func(wr WriteRequest) {
-			prev := (*dto.MetricFamily)(metrics[index].StoredMetrics[metrics[index].Key].Metrics["some_metric"].GobbableMetricFamily).Metric
-			next := metrics[index].WriteRequest.MetricFamilies["some_metric"].Metric
-			submitted := wr.MetricFamilies["some_metric"].Metric
+			name := metrics[index].Name
+			next := values[name]
 
-			for i := 0; i < len(values); i++ {
-				switch wr.MetricFamilies["some_metric"].GetType() {
+			prev := (*dto.MetricFamily)(metrics[index].StoredMetrics[metrics[index].Key].Metrics[name].GobbableMetricFamily).Metric
+			submitted := wr.MetricFamilies[name].Metric
+
+			for i := 0; i < len(next); i++ {
+				switch wr.MetricFamilies[name].GetType() {
 				case dto.MetricType_COUNTER:
-					if submitted[i].Counter.GetValue() != next[i].Counter.GetValue() &&
-						submitted[i].Counter.GetValue() != prev[i].Counter.GetValue()+values[i].Counter.GetValue() {
+					if submitted[i].Counter.GetValue() != prev[i].Counter.GetValue()+next[i].Counter.GetValue() {
 						t.Errorf(
-							"Submitted counter write request %d didn't match, %f != %f + %f",
-							index,
+							"Submitted counter write request didn't match, %f != %f + %f",
 							submitted[i].Counter.GetValue(),
 							prev[i].Counter.GetValue(),
 							next[i].Counter.GetValue(),
 						)
 					}
-				}
+				case dto.MetricType_HISTOGRAM:
+					if submitted[i].Histogram.GetSampleCount() != prev[i].Histogram.GetSampleCount()+next[i].Histogram.GetSampleCount() {
+						t.Errorf("Submitted histogram sample counter write request didn't match")
+					}
 
-				tested += 1
+					if submitted[i].Histogram.GetSampleSum() != prev[i].Histogram.GetSampleSum()+next[i].Histogram.GetSampleSum() {
+						t.Errorf("Submitted histogram sample sum write request didn't match")
+					}
+
+					for ii := 0; ii < len(next[i].Histogram.Bucket); ii++ {
+						if submitted[i].Histogram.Bucket[ii].GetCumulativeCount() != prev[i].Histogram.Bucket[ii].GetCumulativeCount()+next[i].Histogram.Bucket[ii].GetCumulativeCount() {
+							t.Errorf("Submitted histogram bucket counter write request didn't match")
+						}
+
+						upperBound := prev[i].Histogram.Bucket[ii].GetUpperBound()
+
+						if upperBound < next[i].Histogram.Bucket[ii].GetUpperBound() {
+							upperBound = next[i].Histogram.Bucket[ii].GetUpperBound()
+						}
+
+						if submitted[i].Histogram.Bucket[ii].GetUpperBound() != upperBound {
+							t.Errorf("Submitted histogram bucket upper bound write request didn't match")
+						}
+					}
+				}
 			}
 
 			index += 1
@@ -202,7 +288,7 @@ func TestAggregation(t *testing.T) {
 
 	adms.Shutdown()
 
-	if index != len(metrics) && tested != len(metrics)*2 {
-		t.Error("Not all write requests were handled")
+	if index != len(metrics) {
+		t.Errorf("Not all write requests were handled, %d != %d", index, len(metrics))
 	}
 }

@@ -121,6 +121,8 @@ func (adms *AtomicDiskMetricStore) processWriteRequest(wr WriteRequest) {
 		switch mf.GetType() {
 		case dto.MetricType_COUNTER:
 			incrementCounter(name, &group, mf)
+		case dto.MetricType_HISTOGRAM:
+			incrementHistogram(name, &group, mf)
 		}
 	}
 }
@@ -152,9 +154,37 @@ func getStoredMetric(name string, group *MetricGroup, metric *dto.Metric) *dto.M
 func incrementCounter(name string, group *MetricGroup, mf *dto.MetricFamily) {
 	for _, metric := range mf.GetMetric() {
 		storedMetric := getStoredMetric(name, group, metric)
+		counter := metric.GetCounter()
 
-		if storedMetric != nil && metric.GetCounter() != nil {
-			*metric.GetCounter().Value += storedMetric.GetCounter().GetValue()
+		if storedMetric != nil && counter != nil {
+			*counter.Value += storedMetric.GetCounter().GetValue()
+		}
+	}
+}
+
+func incrementHistogram(name string, group *MetricGroup, mf *dto.MetricFamily) {
+	for _, metric := range mf.GetMetric() {
+		storedMetric := getStoredMetric(name, group, metric)
+		histogram := metric.GetHistogram()
+
+		if storedMetric != nil && histogram != nil {
+			storedHistogram := storedMetric.GetHistogram()
+			storedBuckets := storedHistogram.GetBucket()
+			buckets := histogram.GetBucket()
+
+			*histogram.SampleCount += storedHistogram.GetSampleCount()
+			*histogram.SampleSum += storedHistogram.GetSampleSum()
+
+			for i := 0; i < len(buckets) && i < len(storedBuckets); i++ {
+				bucket := buckets[i]
+				storedBucket := storedBuckets[i]
+
+				*bucket.CumulativeCount += storedBucket.GetCumulativeCount()
+
+				if storedBucket.GetUpperBound() > bucket.GetUpperBound() {
+					*bucket.UpperBound = storedBucket.GetUpperBound()
+				}
+			}
 		}
 	}
 }
